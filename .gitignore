@@ -1,4 +1,30 @@
-venv
-./unitree_ros2
-./unitree_sdk2
+cd ~/robot_cpp/robot_cpp
+nano .gitignore
+```
 
+Change it to:
+```
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.env
+
+# Unitree repos
+unitree_ros2/
+unitree_sdk2/
+
+# ROS2 builds
+build/
+install/
+log/
+
+# Audio
+*.wav
+
+# IDE
+.vscode/
+.idea/
+*.swp
