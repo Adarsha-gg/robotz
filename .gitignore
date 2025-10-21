@@ -1,9 +1,3 @@
-cd ~/robot_cpp/robot_cpp
-nano .gitignore
-```
-
-Change it to:
-```
 # Python
 venv/
 __pycache__/
