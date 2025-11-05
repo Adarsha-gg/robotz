@@ -12,7 +12,7 @@ unitree_sdk2/
 unitree_sdk2_python/
 lidar
 mocap_data
-unitree_mujoco
+unitree_mujoco/
 # ROS2 builds
 build/
 install/
