@@ -5,12 +5,14 @@ __pycache__/
 *.pyo
 *.egg-info/
 .env
-
+piper_voices
 # Unitree repos
 unitree_ros2/
 unitree_sdk2/
 unitree_sdk2_python/
-
+lidar
+mocap_data
+unitree_mujoco
 # ROS2 builds
 build/
 install/
@@ -22,4 +24,4 @@ log/
 # IDE
 .vscode/
 .idea/
-*.swp
+*.swpunitree_mujoco/
