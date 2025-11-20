@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """
 Command Parser with LLM Intent Understanding (Groq API)
+
+ARCHITECTURE OVERVIEW:
+1. This module receives raw text from the user (e.g., "make the lights red").
+2. It constructs a prompt for the LLM (Llama 3) that explains the robot's capabilities.
+3. It asks the LLM to return a JSON object describing the action.
+   - Example: {"action_type": "led", "action": "red"}
+4. It parses the JSON and executes the corresponding function in AudioClient.
 """
 
 import json
@@ -14,17 +21,21 @@ class CommandParser:
     """Parse voice commands for robot actions using LLM interpretation"""
 
     def __init__(self, audio_client, groq_client=None):
+        # We need the audio_client to actually EXECUTE the commands (move, light up, etc.)
         self.audio_client = audio_client
+        
+        # We use Groq (Llama 3) to understand natural language
         self.groq_client = groq_client or Groq(api_key=os.getenv("GROQ_API_KEY"))
 
         # === Gesture & LED Mappings ===
+        # These are the internal IDs the robot understands
         self.gestures = {
-            "hello": 0,
-            "turn": 1,
-            "goodbye": 1,
-            "shake_hand": 2,
-            "stop": 3,
-            "release": 3,
+            "hello": 0,       # Wave
+            "turn": 1,        # Turn around
+            "goodbye": 1,     # turn back and wave(for now)
+            "shake_hand": 2,  # Extend hand
+            "stop": 3,        # Stop moving
+            "release": 3,     # Release hand
         }
 
         self.led_colors = {
@@ -41,10 +52,21 @@ class CommandParser:
     # Primary Parse Function
     # --------------------------------------------------
     def parse(self, text):
-        """Main entry point for command parsing"""
+        """
+        Main entry point for command parsing.
+        
+        Args:
+            text: The user's spoken text (e.g. "turn red")
+            
+        Returns:
+            (is_command, response_text)
+            - is_command: True if an action was taken, False if it's just chat.
+            - response_text: What the robot should say back.
+        """
+        # Step 1: Ask the LLM what this text means
         result = self.llm_interpret(text)
         
-        # Safety: handle if LLM returns a list
+        # Safety: handle if LLM returns a list (it shouldn't, but AI is unpredictable)
         if isinstance(result, list):
             print(f"⚠️ Got list in parse(), taking first item")
             result = result[0] if result else {"action_type": "unknown"}
@@ -58,14 +80,21 @@ class CommandParser:
             print(f"❌ Missing action_type in parse(). Got: {result}")
             return False, "Invalid command format"
         
+        # Step 2: Execute the action described by the LLM
         return self._execute_single_action(result)
 
     # --------------------------------------------------
     # LLM Interpretation (Groq)
     # --------------------------------------------------
     def llm_interpret(self, text):
-        """Use LLM to interpret user's intent and map to a known action"""
+        """
+        Use LLM to interpret user's intent and map to a known action.
+        
+        This is the "Brain" of the command system. It takes vague human speech
+        and converts it into precise JSON instructions.
+        """
         try:
+            # Construct the prompt. We tell the LLM exactly what the robot can do.
             prompt = f"""You are a robot command interpreter. Analyze this command and return a JSON response.
 
 Available capabilities:
@@ -93,14 +122,15 @@ Respond with ONLY valid JSON in this format (single action only):
     "parameters": {{}} (optional, for volume numbers)
 }}"""
 
+            # Send to Groq API
             response = self.groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
                     {"role": "system", "content": "You interpret natural language into robot control commands. Always return valid JSON for a SINGLE action only."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.1,
-                response_format={"type": "json_object"}
+                temperature=0.1, # Low temperature = more deterministic/precise
+                response_format={"type": "json_object"} # Force JSON output
             )
 
             content = response.choices[0].message.content
@@ -140,7 +170,10 @@ Respond with ONLY valid JSON in this format (single action only):
     # Action Execution
     # --------------------------------------------------
     def _execute_single_action(self, result):
-        """Execute a single parsed action"""
+        """
+        Execute a single parsed action.
+        Dispatches to the appropriate handler based on 'action_type'.
+        """
         # Final safety check
         if not isinstance(result, dict):
             print(f"❌ Invalid action type in _execute_single_action: {type(result)}")
@@ -152,6 +185,7 @@ Respond with ONLY valid JSON in this format (single action only):
         
         action_type = result.get("action_type")
         
+        # Dispatcher
         if action_type == "gesture":
             return self.handle_gesture(result)
         
@@ -162,6 +196,7 @@ Respond with ONLY valid JSON in this format (single action only):
             return self.handle_volume(result)
         
         elif action_type == "unknown":
+            # If LLM says "unknown", it means it's probably just conversation
             return False, "Command not recognized"
         
         return False, "Command not understood"
@@ -170,11 +205,12 @@ Respond with ONLY valid JSON in this format (single action only):
     # Action Handlers
     # --------------------------------------------------
     def handle_gesture(self, result):
-        """Handle gesture commands"""
+        """Handle gesture commands (wave, handshake, etc.)"""
         action = result.get("action", "").lower()
         gesture_id = self.gestures.get(action)
         
         if gesture_id is not None:
+            # Call the hardware client to trigger the move
             success = self.trigger_gesture(gesture_id)
             if success:
                 return True, f"{action.replace('_', ' ').title()}"
@@ -193,6 +229,7 @@ Respond with ONLY valid JSON in this format (single action only):
         
         rgb = self.led_colors.get(action)
         if rgb:
+            # Call hardware client to set color
             self.audio_client.led_control(*rgb)
             return True, f"{action.title()} lights on"
         
@@ -222,12 +259,16 @@ Respond with ONLY valid JSON in this format (single action only):
     # Gesture Trigger
     # --------------------------------------------------
     def trigger_gesture(self, action_id):
-        """Send gesture action via loco_publisher"""
+        """
+        Send gesture action via loco_publisher.
+        This constructs the specific API packet for the robot's locomotion controller.
+        """
         try:
+            # API 7106 is for "Sport Mode" actions
             req = self.audio_client._create_request(7106, json.dumps({"data": action_id}))
             self.audio_client.loco_publisher.publish(req)
 
-            # Auto-release handshake
+            # Special case: Handshake needs to be released after a few seconds
             if action_id == 2:
                 threading.Thread(target=self._delayed_release, daemon=True).start()
 
@@ -240,6 +281,7 @@ Respond with ONLY valid JSON in this format (single action only):
         """Auto-release handshake after 5 seconds"""
         time.sleep(5)
         try:
+            # Action 3 is "Stand/Release"
             req = self.audio_client._create_request(7106, json.dumps({"data": 3}))
             self.audio_client.loco_publisher.publish(req)
             print("✅ Auto-released handshake")

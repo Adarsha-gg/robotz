@@ -2,6 +2,17 @@
 """
 Voice GPT Node - ROS2 node integrating audio, TTS, and GPT
 NOW WITH MICROPHONE ACTIVATION
+
+ARCHITECTURE OVERVIEW:
+1. This node initializes and connects to the robot's internal ROS2 network.
+2. It subscribes to the robot's audio stream (/audio_msg) to "hear" what the robot hears.
+3. It disables the robot's built-in GPT so it doesn't conflict with our custom one.
+4. When audio is received:
+   a. It checks if the text is English.
+   b. It sends the text to the CommandParser to see if it's a command (e.g. "turn red").
+   c. If it's a command, it executes it immediately via AudioClient.
+   d. If it's not a command, it sends it to GPTHandler to get a conversational response.
+   e. The response is sent to TTSEngine to be spoken aloud.
 """
 
 import rclpy
@@ -19,6 +30,7 @@ import threading
 from groq import Groq
 from dotenv import load_dotenv
 
+# Import helper classes that handle specific subsystems
 from .audio_client import G1AudioClient
 from .tts_engine import TTSEngine
 from .gpt_handler import GPTHandler
@@ -30,24 +42,31 @@ class VoiceGPTNode(Node):
     """ROS2 node for voice-controlled GPT conversations with microphone activation"""
     
     def __init__(self):
+        # Initialize the ROS2 node with name 'voice_gpt_node'
         super().__init__('voice_gpt_node')
         
-        # Load environment variables
+        # Load environment variables (API keys, etc.) from .env file
         load_dotenv()
         
-        # Initialize audio client
+        # --- SUBSYSTEM INITIALIZATION ---
+        # 1. Audio Client: Handles low-level communication with the robot (sending requests)
         self.audio_client = G1AudioClient()
-        # Initialize TTS engine
+        
+        # 2. TTS Engine: Handles converting text to speech (using Piper)
         self.tts_engine = TTSEngine(self.audio_client)
-        # Don't use LED controller - keep it simple
+        
+        # Don't use LED controller - keep it simple for now
+        # self.led_controller = LEDController(self.audio_client)
 
         self.is_speaking = False
 
-        # Get Groq client for manual transcription
+        # 3. Groq Client: The connection to the LLM (Llama 3)
         self.groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
         
-        # Initialize GPT handler with command parser
+        # 4. Command Parser: Analyzes text to find commands (like "turn red")
         self.command_parser = CommandParser(self.audio_client, groq_client=self.groq_client)
+        
+        # 5. GPT Handler: Manages the conversation history and persona
         self.gpt_handler = GPTHandler(
             self.tts_engine,
             command_parser=self.command_parser,
@@ -56,16 +75,19 @@ class VoiceGPTNode(Node):
             groq_client=self.groq_client
         )
         
-        # === MICROPHONE INTERCEPTION ===
-        # Subscribe to robot's microphone output (THIS IS THE KEY!)
+        # === MICROPHONE INTERCEPTION (CRITICAL) ===
+        # This is where we "hook" into the robot's ears.
+        # The robot publishes transcribed text to '/audio_msg'.
+        # We subscribe to it so we receive every word it hears.
         self.robot_audio_sub = self.create_subscription(
             String,
-            '/audio_msg',  # Robot publishes transcribed speech here
-            self.robot_audio_callback,
+            '/audio_msg',  # Topic where robot publishes transcribed speech
+            self.robot_audio_callback, # Function called when message arrives
             10
         )
         
-        # === MANUAL INPUT CHANNELS (optional) ===
+        # === MANUAL INPUT CHANNELS (Optional) ===
+        # These allow us to inject audio or text manually for testing
         self.audio_sub = self.create_subscription(
             AudioData, '/gpt_audio_input', self.audio_callback, 10)
         self.text_sub = self.create_subscription(
@@ -73,9 +95,11 @@ class VoiceGPTNode(Node):
         
         
         # === OUTPUT ===
+        # We publish our responses here so other nodes can see them
         self.text_pub = self.create_publisher(String, '/gpt_response', 10)
         
         # === VOICE CONTROL (for microphone activation) ===
+        # Used to send API commands to enable/disable the mic
         self.voice_control_pub = self.create_publisher(
             Request,
             '/api/voice/request',
@@ -83,6 +107,7 @@ class VoiceGPTNode(Node):
         )
         
         # === GPT CONTROL (for disabling robot's GPT) ===
+        # Used to send API commands to kill the built-in chatbot
         self.gpt_control_pub = self.create_publisher(
             Request,
             '/api/gpt/request',
@@ -91,12 +116,13 @@ class VoiceGPTNode(Node):
         
         self.get_logger().info('Voice GPT Node initialized!')
         
-        # Set initial volume and LED to green (solid)
+        # Set initial state: Volume 50%, LED Green
         time.sleep(0.5)
         self.audio_client.set_volume(50)
         self.audio_client.led_control(0, 255, 0)  # Green = ready
         
         # === CONTROLLER MONITORING ===
+        # Listen to the wireless controller to detect button presses
         self.create_subscription(
             WirelessController,
             '/wirelesscontroller',
@@ -109,6 +135,7 @@ class VoiceGPTNode(Node):
         
         
         # === ENABLE MICROPHONE ON STARTUP ===
+        # Immediately try to take control of the microphone
         self.enable_microphone()
     
     def enable_microphone(self, mode=2):
@@ -120,7 +147,8 @@ class VoiceGPTNode(Node):
             mode: 1=always_listening, 2=push_to_talk, 3=close_interaction
         """
         def send_enable():
-            time.sleep(2)  # Wait for node initialization
+            # Wait a bit for connections to establish
+            time.sleep(2)
             
             self.get_logger().info("=" * 60)
             self.get_logger().info("🎤 Activating robot microphone...")
@@ -128,7 +156,8 @@ class VoiceGPTNode(Node):
             self.get_logger().info("=" * 60)
             
             # FIRST: Disable robot's GPT service
-            # Try multiple disable methods
+            # We send multiple disable commands to be sure it's dead.
+            # If we don't do this, the robot will answer AND we will answer (double talk).
             disable_attempts = [
                 {"action": "disable"},
                 {"state": False},
@@ -151,6 +180,7 @@ class VoiceGPTNode(Node):
             self.get_logger().info("✅ GPT disable commands sent")
             
             # SECOND: Enable microphone (API 1008)
+            # This tells the robot to start listening and transcribing.
             mic_enable = Request()
             mic_enable.header.identity.id = 8001007
             mic_enable.header.identity.api_id = 1008  # Voice mode control API
@@ -168,8 +198,7 @@ class VoiceGPTNode(Node):
             self.get_logger().info("✅ Robot's GPT disabled - using YOUR custom GPT only!")
             self.get_logger().info("🗣️  Speak to the robot...")
         
-        # Run in background
-        
+        # Run this in a background thread so we don't block the main loop
         threading.Thread(target=send_enable, daemon=True).start()
     
     
@@ -177,10 +206,18 @@ class VoiceGPTNode(Node):
     def robot_audio_callback(self, msg):
         """
         MAIN VOICE INPUT HANDLER
-        Only filters non-English transcriptions
+        This function triggers whenever the robot hears something.
+        
+        Flow:
+        1. Receive JSON string from robot.
+        2. Parse JSON to get text.
+        3. Filter out non-English noise.
+        4. Send to CommandParser -> Is it a command?
+        5. If Command -> Execute it.
+        6. If Not Command -> Send to GPT -> Speak response.
         """
         try:
-            # Parse JSON
+            # 1. Parse JSON
             audio_data = json.loads(msg.data)
             text = audio_data.get('text', '').strip()
             confidence = audio_data.get('confidence', 0.0)
@@ -188,7 +225,9 @@ class VoiceGPTNode(Node):
             if not text:
                 return
             
-            # Check if English (ASCII characters only)
+            # 2. Filter Noise (Non-English check)
+            # The robot sometimes hallucinates Chinese characters from noise.
+            # We check if the text is mostly ASCII (English).
             ascii_ratio = sum(1 for c in text if ord(c) < 128) / len(text)
             
             if ascii_ratio < 0.7:
@@ -203,23 +242,32 @@ class VoiceGPTNode(Node):
             self.get_logger().error("JSON parse failed")
             return
         
-        # Process the text
+        # 3. Process the text
         try:
+            # Step A: Check for Commands
+            # "is_command" will be True if the user said something like "turn red"
             is_command, cmd_response = self.command_parser.parse(text)
             
             if is_command:
+                # It WAS a command!
                 self.get_logger().info(f"⚙️ Command: {cmd_response}")
+                # Speak confirmation (e.g., "Turning lights red")
                 self.tts_engine.speak(cmd_response)
                 reply = cmd_response
             else:
+                # It was NOT a command, so it's a conversation.
                 self.get_logger().info("🤖 Processing with GPT...")
+                
+                # Step B: Ask GPT
+                # This sends the text + history to Groq
                 reply = self.gpt_handler.process_text(text)
                 
                 if reply:
                     self.get_logger().info("🔊 Speaking...")
+                    # Step C: Speak the response
                     self.tts_engine.speak(reply)
             
-            # Publish
+            # 4. Publish the response (for logging/UI)
             if reply:
                 msg = String()
                 msg.data = reply
@@ -231,10 +279,13 @@ class VoiceGPTNode(Node):
             traceback.print_exc()
     
     def text_callback(self, msg):
-        """Handle manual text command input"""
+        """
+        Handle manual text command input
+        Useful for testing without speaking.
+        """
         self.get_logger().info(f'📝 Text command: {msg.data}')
         
-        # Process through GPT (command parser is inside gpt_handler)
+        # Process through GPT (command parser is inside gpt_handler too)
         reply = self.gpt_handler.process_text(msg.data)
         
         if reply:
@@ -247,11 +298,14 @@ class VoiceGPTNode(Node):
             self.text_pub.publish(response_msg)
     
     def audio_callback(self, msg):
-        """Handle manual audio input for transcription (via /gpt_audio_input topic)"""
+        """
+        Handle manual audio input for transcription (via /gpt_audio_input topic)
+        This is for sending raw audio bytes if you aren't using the robot's mic.
+        """
         self.get_logger().info('🎵 Processing manual audio input...')
         
         try:
-            # Save audio to temporary file
+            # 1. Save audio to temporary WAV file
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
                 with wave.open(temp_wav.name, 'wb') as wav:
                     wav.setnchannels(1)
@@ -260,7 +314,7 @@ class VoiceGPTNode(Node):
                     wav.writeframes(bytes(msg.data))
                 temp_path = temp_wav.name
             
-            # Transcribe using Groq Whisper
+            # 2. Transcribe using Groq Whisper
             with open(temp_path, 'rb') as audio_file:
                 transcript = self.groq_client.audio.transcriptions.create(
                     file=(temp_path, audio_file.read()),
@@ -272,10 +326,10 @@ class VoiceGPTNode(Node):
             text = transcript.strip()
             self.get_logger().info(f'Transcribed: {text}')
             
-            # Process through GPT
+            # 3. Process through GPT
             reply = self.gpt_handler.process_text(text)
             
-            # Publish response
+            # 4. Publish response
             if reply:
                 response_msg = String()
                 response_msg.data = reply
@@ -322,8 +376,10 @@ class VoiceGPTNode(Node):
         self.breathing_active = False
 
     def _breathing_loop(self):
-        """Ultra-smooth breathing with ease-in-out - purple color"""
-        
+        """
+        Ultra-smooth breathing with ease-in-out - purple color
+        Runs in a separate thread to not block main logic.
+        """
         
         cycle_duration = 3.5  # Slower cycle
         update_rate = 60

@@ -25,3 +25,5 @@ log/
 .vscode/
 .idea/
 *.swpunitree_mujoco/
+RoboJuDo
+g1_spinkick_example
